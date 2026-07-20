@@ -17,6 +17,18 @@ class Bachs_gateway extends App_gateway
     private const LIVE_BASE_URL = 'https://api.bachs.io';
     private const TEST_BASE_URL = 'https://sandbox-api.bachs.io';
 
+    /**
+     * The checkout (frontend) domain is a DIFFERENT host from the API base
+     * URL above (confirmed live: a real checkout_url was
+     * https://sandbox-checkout.bachs.io/... while the API itself is
+     * sandbox-api.bachs.io) -- bachs.js's own Checkout.open() rejects any
+     * checkoutUrl whose origin doesn't match the baseUrl passed to
+     * Initialize(), so the overlay view needs this, separately from the
+     * API base URL.
+     */
+    private const LIVE_CHECKOUT_ORIGIN = 'https://checkout.bachs.io';
+    private const TEST_CHECKOUT_ORIGIN = 'https://sandbox-checkout.bachs.io';
+
     public function __construct()
     {
         parent::__construct();
@@ -182,7 +194,11 @@ class Bachs_gateway extends App_gateway
     private function deliver_checkout(string $checkoutUrl): void
     {
         if ($this->getSetting('use_overlay_checkout') == '1') {
-            $this->ci->load->view('bachs/overlay', ['checkout_url' => $checkoutUrl]);
+            $checkoutOrigin = $this->is_test_mode() ? self::TEST_CHECKOUT_ORIGIN : self::LIVE_CHECKOUT_ORIGIN;
+            $this->ci->load->view('bachs/overlay', [
+                'checkout_url'    => $checkoutUrl,
+                'checkout_origin' => $checkoutOrigin,
+            ]);
             return;
         }
 

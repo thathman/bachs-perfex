@@ -5,7 +5,7 @@ defined('BASEPATH') or exit('No direct script access allowed');
 /*
 Module Name: Bachs.io
 Description: Bachs.io payment gateway integration for Perfex CRM, with its own self-contained webhook idempotency, retry, and dead-letter tracking.
-Version: 1.1.0
+Version: 1.2.0
 Requires at least: 3.3.*
 */
 

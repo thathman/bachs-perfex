@@ -103,7 +103,9 @@ This means your Bachs API key needs permission to manage products (create and li
 Bachs offers two ways to present the same checkout session, and this module supports both from one toggle:
 
 - **Hosted** (the default): the client's browser is redirected to a checkout page hosted by Bachs.
-- **Overlay**: the invoice page loads Bachs's own `bachs.js` widget script and invokes it with the same checkout URL. In practice, depending on the Bachs SDK version, this can either present as an on-page modal or perform its own navigation to the checkout page -- either way, the payment confirmation path (webhook-only, described below) is identical.
+- **Overlay**: the invoice page loads Bachs's own `bachs.js` widget script, which opens the checkout in a real iframe modal on top of your own page, without leaving your site.
+
+`bachs.js` validates that the checkout URL it is asked to open lives on the same origin as the `baseUrl` passed to `Bachs.Initialize()`. Sandbox and live checkouts are served from different origins (`sandbox-checkout.bachs.io` vs. `checkout.bachs.io`), so this module passes the matching one for whichever mode is currently active -- get this wrong and the widget silently refuses to open the modal at all, with no visible error.
 
 Both modes use the exact same underlying `checkout_url`; only the presentation differs.
 
@@ -203,6 +205,8 @@ See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 **A checkout fails immediately with an error, especially on a retry.** If the underlying error (visible in Perfex's activity log) mentions a reference already existing for your organization, you are very likely running an older version of this module that reused the bare invoice ID as the checkout reference. Update to the current version, which generates a fresh unique reference per checkout attempt.
 
 **A webhook succeeded on Bachs but the invoice was never marked paid, particularly for a card payment.** Check the event's error message on the Bachs.io admin screen. If it says the amount exceeds the invoice's remaining balance, and the actual charge included a processing fee passed through to the customer, you are likely running an older version that compared the gross charged amount instead of `settlement_amount`. Update to the current version, then use the Replay action on the admin screen to reprocess the event correctly -- it will not double-charge or double-record, since the underlying charge ID is already tracked idempotently.
+
+**Overlay Checkout gets stuck on "Loading secure checkout..." and never opens.** `bachs.js` silently refuses to open a checkout URL whose origin doesn't match the `baseUrl` passed to `Bachs.Initialize()`, and does not surface this as a visible error unless the page listens for the `checkout.error` event. An older version of this module never passed `baseUrl` at all, so the widget defaulted to the live checkout origin -- meaning overlay mode only ever worked in Live mode, and got stuck silently in every Test Mode checkout, since the real `checkout_url` in test mode is on a different (`sandbox-checkout.bachs.io`) origin. Update to the current version, which passes the matching origin for whichever mode is active.
 
 **A webhook returns 419 / Page Expired.** The webhook route is missing from `csrf_exclude_uris`; see [Webhooks](#webhooks).
 

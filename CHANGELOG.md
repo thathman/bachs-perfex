@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.0 - 2026-07-20
+
+### Fixed
+
+- **Overlay Checkout stuck permanently on "Loading secure checkout..." in
+  Test Mode.** `bachs.js` validates that the checkout URL passed to
+  `Bachs.Checkout.open()` lives on the same origin as the `baseUrl` given
+  to `Bachs.Initialize()`, and silently does nothing (emitting an unlistened
+  `checkout.error` event) if it doesn't match -- confirmed directly by
+  reading the real `bachs.js` source. The overlay view never passed
+  `baseUrl` at all, so it defaulted to the live checkout origin
+  (`checkout.bachs.io`); since a sandbox checkout's real URL is on a
+  different origin (`sandbox-checkout.bachs.io`), overlay mode only ever
+  worked in Live mode and hung silently in Test Mode. Fixed by passing the
+  correct checkout origin for whichever mode is active, and by listening
+  for `checkout.error` so any future failure is surfaced instead of hanging
+  silently.
+
 ## 1.1.0 - 2026-07-20
 
 ### Changed
