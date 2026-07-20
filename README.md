@@ -1,6 +1,6 @@
 # Bachs.io for Perfex CRM
 
-A native Bachs.io payment gateway module for [Perfex CRM](https://www.perfexcrm.com/), built to the same conventions as the stock Paystack and Flutterwave gateway modules. Includes a shared webhook idempotency and retry foundation (`integration_runtime`) reusable by other integrations in the same install.
+A native Bachs.io payment gateway module for [Perfex CRM](https://www.perfexcrm.com/). One self-contained module: drop in one folder, activate it, configure it. No separate shared-infrastructure module to install first.
 
 <p align="center">
   <a href="https://github.com/sponsors/thathman">
@@ -31,19 +31,20 @@ If this module saves you time, consider [sponsoring the project on GitHub](https
 
 ## Why this exists
 
-Bachs.io has no official Perfex CRM integration. This module adds one that behaves exactly like a stock Perfex payment gateway: it appears in Settings, Payments like any other method, and a client paying an invoice sees the same flow as with Paystack or Flutterwave.
+Bachs.io has no official Perfex CRM integration. This module adds one that behaves exactly like a stock Perfex payment gateway: it appears in Settings, Payments like any other method, and a client paying an invoice sees the same familiar flow as any other online payment option.
 
 The module treats sandbox and live as genuinely separate environments, because that is how Bachs itself treats them: separate base URLs, separate API keys, separate webhook signing secrets, and separate checkout products. Nothing about the module quietly assumes the two environments share anything, since they do not.
 
 ## Features
 
+- One module, one folder. Webhook idempotency, retry, and dead-letter handling are built directly into this module, not split into a second dependency you have to install and activate in the right order.
 - Full sandbox/live separation: distinct API keys and webhook secrets per environment, switched with one Test Mode toggle.
 - Automatic checkout product provisioning. No product ID to create or paste in by hand; see [How automatic product provisioning works](#how-automatic-product-provisioning-works).
 - NGN and USD support out of the box, each invoice automatically routed to a product in its own currency.
-- Hosted checkout (redirect to Bachs) and overlay checkout (Bachs's own JavaScript modal, embedded on your invoice page), toggled with a single setting.
+- Hosted checkout (redirect to Bachs) and overlay checkout (Bachs's own JavaScript widget, invoked from your invoice page), toggled with a single setting.
 - Webhook-only payment confirmation. A client's browser landing back on your site after paying is never treated as proof of payment; only a signature-verified webhook event ever records money against an invoice.
-- Amount and currency sanity checks on every webhook event, so a malformed or unexpected event cannot silently corrupt an invoice balance.
-- A shared idempotency, retry, and dead-letter system (`integration_runtime`), so a webhook delivered twice is processed once, and a webhook that fails because of a transient error (a brief network blip, a momentary database error) is retried automatically with exponential backoff instead of being lost.
+- Amount and currency sanity checks on every webhook event, comparing against the invoice's actual net amount owed (not a card-processing-fee-inclusive total), so a malformed, unexpected, or misread event cannot silently corrupt an invoice balance.
+- Webhook events that fail for a transient reason (a brief network blip, a momentary database error) retry automatically with exponential backoff, and a staff-only screen shows anything still failed or dead-lettered with a one-click manual replay.
 - A staff-only transactions screen showing every confirmed Bachs charge.
 
 ## Requirements
@@ -55,13 +56,12 @@ The module treats sandbox and live as genuinely separate environments, because t
 ## Installation
 
 1. Download or clone this repository.
-2. Copy both `modules/integration_runtime` and `modules/bachs` into your Perfex installation's `modules/` directory, so you end up with `modules/integration_runtime/` and `modules/bachs/` alongside Perfex's own `modules/paystack/`, `modules/flutterwave/`, and so on.
+2. Copy `modules/bachs` into your Perfex installation's `modules/` directory, so you end up with `modules/bachs/`.
 3. Log in to Perfex as a staff member with administrator access and go to **Setup, Modules**.
-4. Activate **Integration Runtime** first. This module owns the shared event table both integrations rely on; activating Bachs before this one will leave webhook processing unable to record anything.
-5. Activate **Bachs.io**.
-6. Go to **Setup, Settings, Sales, Payment Gateways** and open the **Bachs.io** tab to configure it (see [Configuration](#configuration) below).
+4. Activate **Bachs.io**.
+5. Go to **Setup, Settings, Sales, Payment Gateways** and open the **Bachs.io** tab to configure it (see [Configuration](#configuration) below).
 
-If you are packaging this from a ZIP archive rather than cloning the repository, extract it and copy the two folders from inside `modules/` the same way.
+If you are packaging this from a ZIP archive rather than cloning the repository, extract it and copy the one folder from inside `modules/` the same way.
 
 ## Configuration
 
@@ -93,7 +93,7 @@ Bachs requires every checkout to reference a product, and a product's price is f
 
 1. On the first checkout in a given environment and currency, the module asks Bachs for your existing products.
 2. If an active, custom-priced product already exists for that currency, the module reuses it.
-3. If none exists, the module creates one (named, for example, "Airix Media Invoice (NGN)") via the Bachs API.
+3. If none exists, the module creates one (named, for example, "Invoice Payment (NGN)") via the Bachs API.
 4. The resulting product ID is cached internally and reused for every subsequent checkout in that environment and currency. It is never shown on the settings page, because there is nothing for you to configure.
 
 This means your Bachs API key needs permission to manage products (create and list), not only payments. When you generate an API key in the Bachs dashboard, grant it that scope; a key scoped to payments only will fail the automatic-provisioning step. The module's settings page includes a reminder about this next to the webhook URL.
@@ -103,9 +103,9 @@ This means your Bachs API key needs permission to manage products (create and li
 Bachs offers two ways to present the same checkout session, and this module supports both from one toggle:
 
 - **Hosted** (the default): the client's browser is redirected to a checkout page hosted by Bachs.
-- **Overlay**: the invoice page loads Bachs's own `bachs.js` script and opens the identical checkout in a modal, without leaving your site.
+- **Overlay**: the invoice page loads Bachs's own `bachs.js` widget script and invokes it with the same checkout URL. In practice, depending on the Bachs SDK version, this can either present as an on-page modal or perform its own navigation to the checkout page -- either way, the payment confirmation path (webhook-only, described below) is identical.
 
-Both modes use the exact same underlying `checkout_url`; the difference is purely how it is presented; the payment confirmation path (webhook-only, described below) is identical either way.
+Both modes use the exact same underlying `checkout_url`; only the presentation differs.
 
 ## Webhooks
 
@@ -128,6 +128,10 @@ Register this URL as a webhook destination separately in both your Bachs sandbox
 
 Webhook signatures are verified using HMAC-SHA256 over `{unix_timestamp}.{raw_request_body}`, matching the `X-Bachs-Timestamp` and `X-Bachs-Signature` headers Bachs sends, with a 300-second tolerance window against replay. A request with a missing, wrong, or stale signature is rejected before its body is ever parsed.
 
+The invoice a webhook event applies to is resolved from the event's own `metadata.invoice_id` field, not from the checkout's `reference`. Bachs enforces reference uniqueness for the lifetime of your organization, not just while a checkout session is open, so this module generates a fresh, unique reference on every checkout attempt (a retried/abandoned-then-recreated checkout would otherwise be rejected by Bachs as a duplicate reference) and relies on metadata for the actual invoice link.
+
+The amount applied to an invoice is taken from the event's `settlement_amount` field when present, not its `amount` field. For card payments where Bachs passes a processing fee through to the customer, `amount` is the gross, fee-inclusive total actually charged, while `settlement_amount` is the net amount that settles against the invoice -- using the gross figure would make every fee-inclusive card payment look like it "overpaid" the invoice and get rejected by the amount sanity check below.
+
 ## Currencies
 
 The module ships configured for NGN and USD. Adding a third currency means:
@@ -140,44 +144,41 @@ Bachs always settles payouts in NGN or USD regardless of what a customer pays in
 ## Architecture
 
 ```
-modules/
-  integration_runtime/   Shared idempotency, retry, and dead-letter system.
-    models/
-      Integration_events_model.php   Insert-first idempotent recording,
-                                      atomic claim/lock, exponential backoff,
-                                      dead-letter after 6 attempts.
-    controllers/
-      Integration_runtime.php        Staff-only screen: failed + dead-lettered
-                                      events, with a manual replay action.
-
-  bachs/                 The payment gateway itself.
-    bachs.php                        Module bootstrap: registers the gateway,
-                                      the activation hook, and the
-                                      'integration_runtime_process_bachs' retry
-                                      hook.
-    libraries/
-      Bachs_gateway.php               extends App_gateway. Owns settings,
-                                      make_client(), automatic product
-                                      resolution, and process_webhook_event()
-                                      -- the single implementation shared by
-                                      both the live webhook path and the
-                                      cron retry / manual replay path.
-    controllers/
-      Bachs_webhook.php               Public webhook receiver: signature
-                                      verification, body size cap, then
-                                      delegates to Bachs_gateway.
-      Bachs_admin.php                 Staff-only transactions list.
-    src/
-      BachsClient.php                 Thin HTTP client for the Bachs API.
-      BachsAmounts.php                Minor/major unit conversion, string-based
-                                      to avoid float rounding errors.
-    models/
-      Bachs_sessions_model.php        Tracks open checkout sessions per invoice.
-      Bachs_transactions_model.php    Tracks confirmed charges, keyed uniquely
-                                      by Bachs's own charge ID.
+modules/bachs/
+  bachs.php                        Module bootstrap: registers the gateway,
+                                    the activation hook, and the cron retry
+                                    sweep (hooked to Perfex's own
+                                    after_cron_run).
+  libraries/
+    Bachs_gateway.php               extends App_gateway. Owns settings,
+                                    make_client(), automatic product
+                                    resolution, and process_webhook_event()
+                                    -- the single implementation shared by
+                                    both the live webhook path and the
+                                    cron retry / manual replay path.
+  controllers/
+    Bachs_webhook.php               Public webhook receiver: body-size cap,
+                                    signature verification, idempotent
+                                    recording, then delegates to
+                                    Bachs_gateway.
+    Bachs_admin.php                 Staff-only screen: confirmed
+                                    transactions, plus failed/dead-lettered
+                                    webhook events with a manual replay
+                                    action.
+  models/
+    Bachs_events_model.php          Insert-first idempotent event
+                                    recording, atomic claim/lock (so a live
+                                    webhook and the cron sweep can never
+                                    double-process one event), exponential
+                                    backoff, dead-letter after 6 attempts.
+    Bachs_sessions_model.php        Tracks open checkout sessions per invoice.
+    Bachs_transactions_model.php    Tracks confirmed charges, keyed uniquely
+                                    by Bachs's own charge ID.
+  src/
+    BachsClient.php                 Thin HTTP client for the Bachs API.
+    BachsAmounts.php                Minor/major unit conversion, string-based
+                                    to avoid float rounding errors.
 ```
-
-Any other module that receives webhooks from an external service can reuse `integration_runtime` the same way: call `Integration_events_model::record()` to record the event idempotently, `claim()` to lock it, then `mark_processed()` or `mark_failed()`. Register a `integration_runtime_process_{your_provider}` action hook so the cron sweep and the manual replay button can retry your events too.
 
 ## Security
 
@@ -186,9 +187,9 @@ This module handles real money, so a few things are non-negotiable:
 - **A browser redirect is never payment confirmation.** Whether checkout is hosted or overlay, the only thing that ever records a payment against an invoice is a webhook request with a valid signature.
 - **Signature verification is constant-time** (`hash_equals`), to avoid a timing side-channel on the comparison.
 - **Replay protection**: a webhook timestamp more than 300 seconds old or in the future is rejected outright, in addition to the idempotency check on the event ID itself.
-- **Amount sanity checks**: an incoming webhook's reference must be a genuine numeric invoice ID, its amount must be a positive number, its currency must match the invoice's own currency, and the amount must not exceed the invoice's actual remaining balance (with a small epsilon for rounding). A signature proves a request came from Bachs; it does not prove the amount inside it is sane relative to what is actually owed, so this module checks that separately.
+- **Amount sanity checks**: an incoming webhook's `metadata.invoice_id` must be a genuine numeric invoice ID, its settlement amount must be a positive number, its currency must match the invoice's own currency, and the amount must not exceed the invoice's actual remaining balance (with a small epsilon for rounding). A signature proves a request came from Bachs; it does not prove the amount inside it is sane relative to what is actually owed, so this module checks that separately.
 - **A capped request body size** on the public webhook endpoint, rejected before the body is parsed.
-- **Encrypted secrets at rest**: API keys and webhook signing secrets are stored using Perfex's own encryption library (the same one every other gateway module uses), never in plain text.
+- **Encrypted secrets at rest**: API keys and webhook signing secrets are stored using Perfex's own encryption library, never in plain text.
 - **No credentials in this repository.** Every example key or secret you see in this codebase (in comments, in the README) is a format placeholder, never a real value.
 
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
@@ -199,15 +200,19 @@ See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 **Bachs does not appear as a payment option on an invoice.** Check the `currencies` setting on the Bachs.io settings tab. Perfex only shows a gateway on an invoice if the invoice's currency is in that comma-separated list, regardless of whether the gateway is otherwise fully configured.
 
+**A checkout fails immediately with an error, especially on a retry.** If the underlying error (visible in Perfex's activity log) mentions a reference already existing for your organization, you are very likely running an older version of this module that reused the bare invoice ID as the checkout reference. Update to the current version, which generates a fresh unique reference per checkout attempt.
+
+**A webhook succeeded on Bachs but the invoice was never marked paid, particularly for a card payment.** Check the event's error message on the Bachs.io admin screen. If it says the amount exceeds the invoice's remaining balance, and the actual charge included a processing fee passed through to the customer, you are likely running an older version that compared the gross charged amount instead of `settlement_amount`. Update to the current version, then use the Replay action on the admin screen to reprocess the event correctly -- it will not double-charge or double-record, since the underlying charge ID is already tracked idempotently.
+
 **A webhook returns 419 / Page Expired.** The webhook route is missing from `csrf_exclude_uris`; see [Webhooks](#webhooks).
 
 **A webhook returns 404.** Perfex's routing resolves a URI segment to a controller file with `ucfirst()`, so the controller class name must exactly match the folder-plus-class convention used here (`bachs/bachs_webhook/receive`, not `bachs_webhook/receive`). If you have renamed anything, check the resulting URL matches the actual class name.
 
-**Activating a module seems to do nothing.** Perfex's own `App_modules::activate()` only inserts the module's row in `tblmodules`; it does not run `install.php` itself. Both modules in this repository register an activation hook that does, so activating them through **Setup, Modules** creates their tables automatically. If you have modified either module's bootstrap file, keep that hook.
+**Activating the module seems to do nothing.** Perfex's own `App_modules::activate()` only inserts the module's row in `tblmodules`; it does not run `install.php` itself. This module registers an activation hook that does, so activating it through **Setup, Modules** creates its tables automatically. If you have modified the bootstrap file, keep that hook.
 
 ## Uninstalling
 
-Deactivate **Bachs.io** before **Integration Runtime**, since the former depends on the latter's event table. Deactivating a Perfex module does not drop its tables by default; remove `tblbachs_checkout_sessions`, `tblbachs_transactions`, and `tblintegration_events` manually if you want a clean removal, and back up first if any of them hold real transaction history you want to keep.
+Deactivating a Perfex module does not drop its tables by default; remove `tblbachs_checkout_sessions`, `tblbachs_transactions`, and `tblbachs_events` manually if you want a clean removal, and back up first if any of them hold real transaction history you want to keep.
 
 ## Contributing
 

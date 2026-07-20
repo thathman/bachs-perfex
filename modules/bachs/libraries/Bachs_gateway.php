@@ -138,13 +138,24 @@ class Bachs_gateway extends App_gateway
 
         $amountMajor = BachsAmounts::toMajorUnitsString((int) round($data['amount'] * 100));
 
+        // Bachs enforces reference uniqueness for the lifetime of the
+        // organization, not just while a checkout is open (confirmed live,
+        // 2026-07-20: a real "Reference '21' already exists for this
+        // organization" rejection on a retry after the first session had
+        // expired). Reusing the bare invoice id as reference therefore
+        // permanently breaks any retry past the first attempt. The
+        // invoice is instead resolved from metadata.invoice_id in the
+        // webhook (see process_webhook_event()), so reference only needs
+        // to stay human-traceable, not machine-parseable.
+        $reference = 'inv' . $data['invoice']->id . '-' . bin2hex(random_bytes(4));
+
         try {
             $session = $client->createCheckoutSession(
                 $productId,
                 $amountMajor,
                 $email,
                 $email,
-                (string) $data['invoice']->id,
+                $reference,
                 ['invoice_id' => (int) $data['invoiceid'], 'invoice_hash' => (string) $data['invoice']->hash],
                 $returnUrl,
                 $returnUrl
@@ -180,10 +191,9 @@ class Bachs_gateway extends App_gateway
 
     /**
      * Resolves the correct base URL + API key pair for whichever mode
-     * (test/live) is currently enabled -- matching the exact pattern the
-     * stock `paystack` module already uses for its own test_mode_enabled
-     * toggle, confirmed by reading Paystack_gateway.php directly. Also
-     * confirmed directly against docs.bachs.io/integrate/sandbox that
+     * (test/live) is currently enabled, matching the same test/live
+     * toggle pattern used by Perfex's other payment gateway modules.
+     * Confirmed directly against docs.bachs.io/integrate/sandbox that
      * sandbox and production are genuinely separate on every axis (base
      * URL, API key, webhook endpoint, signing secret) -- not a single
      * URL with prefix-based routing as an earlier, less authoritative
@@ -243,8 +253,8 @@ class Bachs_gateway extends App_gateway
 
         try {
             $created = $client->createProduct(
-                'Airix Media Invoice (' . $currency . ')',
-                'Custom-amount checkout for ' . $currency . '-billed Airix Media OS invoices.',
+                'Invoice Payment (' . $currency . ')',
+                'Custom-amount checkout for ' . $currency . '-billed invoices.',
                 $currency
             );
 
@@ -270,13 +280,9 @@ class Bachs_gateway extends App_gateway
      * The single source of truth for turning a verified Bachs webhook
      * envelope into a Perfex payment record. Called from two places that
      * must never drift out of sync with each other: Bachs_webhook::receive()
-     * (the live HTTP path) and bachs_process_integration_event() (the
-     * integration_runtime cron retry / manual-replay path, registered on
-     * the 'integration_runtime_process_bachs' hook in bachs.php) -- without
-     * that hook registered, a transiently-failed event (a network blip, a
-     * brief DB error) would sit in 'failed' status forever, since the cron
-     * sweep fires a hook nobody was listening for. Throws on any rejection;
-     * callers are responsible for mark_processed()/mark_failed().
+     * (the live HTTP path) and Bachs_events_model's own cron retry / manual
+     * replay path. Throws on any rejection; callers are responsible for
+     * mark_processed()/mark_failed().
      */
     public function process_webhook_event(array $envelope): void
     {
@@ -298,22 +304,32 @@ class Bachs_gateway extends App_gateway
             return;
         }
 
-        $reference = $envelope['data']['reference'] ?? null;
-        if (empty($reference) || !ctype_digit((string) $reference)) {
-            throw new \RuntimeException('missing or non-numeric reference on Bachs event');
+        // Resolved from metadata.invoice_id, not the checkout's own
+        // reference string -- reference is now a unique-per-attempt value
+        // (see process_payment()) precisely so it never collides with
+        // Bachs's own permanent per-organization uniqueness constraint;
+        // metadata is the real, stable link back to the invoice.
+        $invoiceId = $envelope['data']['metadata']['invoice_id'] ?? null;
+        if (empty($invoiceId) || !ctype_digit((string) $invoiceId)) {
+            throw new \RuntimeException('missing or non-numeric metadata.invoice_id on Bachs event');
         }
 
-        // Reference is set at checkout creation to exactly the invoice's own
-        // id (see process_payment()) -- a stable, unambiguous round trip,
-        // not a formatted/derived string requiring re-parsing.
-        $invoice = $this->ci->invoices_model->get((int) $reference);
+        $invoice = $this->ci->invoices_model->get((int) $invoiceId);
         if (!$invoice) {
-            throw new \RuntimeException('no invoice with reference ' . $reference);
+            throw new \RuntimeException('no invoice with id ' . $invoiceId);
         }
 
-        $amountStr = $type === 'collection.underpaid'
-            ? ($envelope['data']['amount_paid'] ?? null)
-            : ($envelope['data']['amount'] ?? null);
+        // settlement_amount is the NET amount owed against the invoice --
+        // confirmed live 2026-07-20: a real card payment's "amount" field
+        // was the GROSS customer-charged total including a Bachs
+        // processing fee passed through to the customer ("fee_bearer":
+        // "customer"), while "settlement_amount" was the exact NGN/USD
+        // amount actually due. Using the gross amount here would reject
+        // every fee-inclusive card payment as "exceeding the balance".
+        // Falls back to the older amount/amount_paid fields for event
+        // shapes that don't include settlement_amount.
+        $amountStr = $envelope['data']['settlement_amount']
+            ?? ($type === 'collection.underpaid' ? ($envelope['data']['amount_paid'] ?? null) : ($envelope['data']['amount'] ?? null));
 
         if (empty($amountStr) || !is_numeric($amountStr) || (float) $amountStr <= 0) {
             throw new \RuntimeException('missing or non-positive amount on Bachs event');

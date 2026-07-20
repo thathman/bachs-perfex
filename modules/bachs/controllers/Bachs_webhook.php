@@ -19,7 +19,7 @@ class Bachs_webhook extends App_Controller
     public function __construct()
     {
         parent::__construct();
-        $this->load->model('integration_runtime/integration_events_model');
+        $this->load->model('bachs/bachs_events_model');
         $this->load->library('bachs_gateway');
     }
 
@@ -54,23 +54,23 @@ class Bachs_webhook extends App_Controller
             return;
         }
 
-        $event = $this->integration_events_model->record('bachs', $envelope['type'], $envelope['id'], $raw, true);
+        $event = $this->bachs_events_model->record($envelope['type'], $envelope['id'], $raw, true);
 
         if (!$event['is_new']) {
             echo json_encode(['ok' => true, 'duplicate' => true]);
             return;
         }
 
-        if (!$this->integration_events_model->claim($event['id'])) {
+        if (!$this->bachs_events_model->claim($event['id'])) {
             echo json_encode(['ok' => true]);
             return;
         }
 
         try {
             $this->bachs_gateway->process_webhook_event($envelope);
-            $this->integration_events_model->mark_processed($event['id']);
+            $this->bachs_events_model->mark_processed($event['id']);
         } catch (\Throwable $e) {
-            $this->integration_events_model->mark_failed($event['id'], $e->getMessage());
+            $this->bachs_events_model->mark_failed($event['id'], $e->getMessage());
         }
 
         echo json_encode(['ok' => true]);

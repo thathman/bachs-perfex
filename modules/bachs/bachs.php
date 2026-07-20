@@ -4,8 +4,8 @@ defined('BASEPATH') or exit('No direct script access allowed');
 
 /*
 Module Name: Bachs.io
-Description: Bachs payment gateway integration for Perfex CRM, following the paystack/flutterwave module pattern, built on integration_runtime for webhook idempotency.
-Version: 1.0.0
+Description: Bachs.io payment gateway integration for Perfex CRM, with its own self-contained webhook idempotency, retry, and dead-letter tracking.
+Version: 1.1.0
 Requires at least: 3.3.*
 */
 
@@ -27,33 +27,17 @@ function bachs_module_activation_hook()
 register_payment_gateway('bachs_gateway', 'bachs');
 
 /**
- * Without this, integration_runtime's cron sweep and its admin "replay"
- * button both fire 'integration_runtime_process_bachs' for any
- * failed/dead-lettered Bachs event -- with nothing listening, a
- * transiently-failed webhook (network blip, brief DB error) would sit in
- * 'failed' status forever instead of ever being retried automatically.
+ * Sweeps webhook events due for retry on every Perfex cron run (the same
+ * mechanism goals/surveys/backup already use) -- self-contained, no
+ * separate shared-runtime module or cross-module hook involved.
  */
-hooks()->add_action('integration_runtime_process_bachs', 'bachs_process_integration_event');
+hooks()->add_action('after_cron_run', 'bachs_retry_sweep');
 
-function bachs_process_integration_event($event)
+function bachs_retry_sweep()
 {
     $CI = &get_instance();
-    $CI->load->model('integration_runtime/integration_events_model');
-    $CI->load->library('bachs_gateway');
-
-    $envelope = json_decode($event->payload, true);
-
-    if (!is_array($envelope)) {
-        $CI->integration_events_model->mark_failed($event->id, 'stored payload is not valid JSON');
-        return;
-    }
-
-    try {
-        $CI->bachs_gateway->process_webhook_event($envelope);
-        $CI->integration_events_model->mark_processed($event->id);
-    } catch (\Throwable $e) {
-        $CI->integration_events_model->mark_failed($event->id, $e->getMessage());
-    }
+    $CI->load->model('bachs/bachs_events_model');
+    $CI->bachs_events_model->retry_due_events();
 }
 
 hooks()->add_action('admin_init', 'bachs_module_init_menu_items');

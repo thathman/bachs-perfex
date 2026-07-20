@@ -2,7 +2,12 @@
 
 defined('BASEPATH') or exit('No direct script access allowed');
 
-class Integration_events_model extends App_Model
+/**
+ * Idempotency, retry, and dead-letter tracking for Bachs webhook events --
+ * self-contained within this single module (no separate shared-runtime
+ * module to install/activate first).
+ */
+class Bachs_events_model extends App_Model
 {
     const STATUS_PENDING = 'pending';
     const STATUS_PROCESSING = 'processing';
@@ -19,16 +24,15 @@ class Integration_events_model extends App_Model
 
     /**
      * Insert-first idempotent event recording. Returns the existing row if
-     * (provider, external_event_id) was already seen -- never records the
-     * same external event twice, regardless of retry/redelivery.
+     * this external_event_id was already seen -- never records the same
+     * Bachs event twice, regardless of retry/redelivery.
      *
      * @return array{id: int, is_new: bool}
      */
-    public function record($provider, $event_type, $external_event_id, $payload, $signature_verified = false, $correlation_id = null)
+    public function record($event_type, $external_event_id, $payload, $signature_verified = false)
     {
-        $existing = $this->db->where('provider', $provider)
-            ->where('external_event_id', $external_event_id)
-            ->get(db_prefix() . 'integration_events')
+        $existing = $this->db->where('external_event_id', $external_event_id)
+            ->get(db_prefix() . 'bachs_events')
             ->row();
 
         if ($existing) {
@@ -37,11 +41,9 @@ class Integration_events_model extends App_Model
 
         $payload_json = is_string($payload) ? $payload : json_encode($payload);
 
-        $this->db->insert(db_prefix() . 'integration_events', [
-            'provider'            => $provider,
+        $this->db->insert(db_prefix() . 'bachs_events', [
             'event_type'          => $event_type,
             'external_event_id'   => $external_event_id,
-            'correlation_id'      => $correlation_id,
             'payload'             => $payload_json,
             'payload_hash'        => hash('sha256', $payload_json),
             'signature_verified'  => $signature_verified ? 1 : 0,
@@ -55,10 +57,10 @@ class Integration_events_model extends App_Model
 
     public function mark_processed($id)
     {
-        $this->db->where('id', $id)->update(db_prefix() . 'integration_events', [
-            'status'       => self::STATUS_PROCESSED,
-            'locked_at'    => null,
-            'processed_at' => date('Y-m-d H:i:s'),
+        $this->db->where('id', $id)->update(db_prefix() . 'bachs_events', [
+            'status'        => self::STATUS_PROCESSED,
+            'locked_at'     => null,
+            'processed_at'  => date('Y-m-d H:i:s'),
             'error_message' => null,
         ]);
     }
@@ -80,7 +82,7 @@ class Integration_events_model extends App_Model
         $truncated_error = mb_substr((string) $error_message, 0, 500);
 
         if ($attempt >= self::MAX_ATTEMPTS) {
-            $this->db->where('id', $id)->update(db_prefix() . 'integration_events', [
+            $this->db->where('id', $id)->update(db_prefix() . 'bachs_events', [
                 'status'        => self::STATUS_DEAD_LETTER,
                 'attempt_count' => $attempt,
                 'locked_at'     => null,
@@ -93,7 +95,7 @@ class Integration_events_model extends App_Model
         // Exponential backoff: 1, 2, 4, 8, 16 minutes.
         $delay_minutes = 2 ** ($attempt - 1);
 
-        $this->db->where('id', $id)->update(db_prefix() . 'integration_events', [
+        $this->db->where('id', $id)->update(db_prefix() . 'bachs_events', [
             'status'        => self::STATUS_FAILED,
             'attempt_count' => $attempt,
             'locked_at'     => null,
@@ -105,7 +107,7 @@ class Integration_events_model extends App_Model
     /**
      * Claims an event for processing by setting status=processing and
      * locked_at=now, using an UPDATE ... WHERE status<>'processing' guard so
-     * a live webhook handler and the cron sweep can never both process the
+     * a live webhook request and the cron sweep can never both process the
      * same event at once.
      *
      * @return bool true if this call won the claim
@@ -113,7 +115,7 @@ class Integration_events_model extends App_Model
     public function claim($id)
     {
         $this->db->where('id', $id)->where('status !=', self::STATUS_PROCESSING);
-        $this->db->update(db_prefix() . 'integration_events', [
+        $this->db->update(db_prefix() . 'bachs_events', [
             'status'    => self::STATUS_PROCESSING,
             'locked_at' => date('Y-m-d H:i:s'),
         ]);
@@ -123,14 +125,14 @@ class Integration_events_model extends App_Model
 
     public function get($id)
     {
-        return $this->db->where('id', $id)->get(db_prefix() . 'integration_events')->row();
+        return $this->db->where('id', $id)->get(db_prefix() . 'bachs_events')->row();
     }
 
     public function get_dead_letters()
     {
         return $this->db->where('status', self::STATUS_DEAD_LETTER)
             ->order_by('created_at', 'DESC')
-            ->get(db_prefix() . 'integration_events')
+            ->get(db_prefix() . 'bachs_events')
             ->result();
     }
 
@@ -138,21 +140,20 @@ class Integration_events_model extends App_Model
     {
         return $this->db->where('status', self::STATUS_FAILED)
             ->order_by('next_retry_at', 'ASC')
-            ->get(db_prefix() . 'integration_events')
+            ->get(db_prefix() . 'bachs_events')
             ->result();
     }
 
     /**
-     * Cron entry point (hooked to after_cron_run). Finds every event whose
-     * next_retry_at has passed and asks whichever provider module registered
-     * a processor to try it again, via a per-provider action hook so this
-     * module never needs to know how to process any specific provider's events.
+     * Cron entry point (hooked to after_cron_run in bachs.php). Finds every
+     * event whose next_retry_at has passed and reprocesses it directly --
+     * no cross-module hook needed since this module owns its own retry path.
      */
     public function retry_due_events()
     {
         $due = $this->db->where('status', self::STATUS_FAILED)
             ->where('next_retry_at <=', date('Y-m-d H:i:s'))
-            ->get(db_prefix() . 'integration_events')
+            ->get(db_prefix() . 'bachs_events')
             ->result();
 
         foreach ($due as $event) {
@@ -182,8 +183,21 @@ class Integration_events_model extends App_Model
             return; // another worker already has it
         }
 
-        // Each provider module registers itself here, e.g.:
-        //   hooks()->add_action('integration_runtime_process_bachs', 'bachs_process_integration_event');
-        hooks()->do_action('integration_runtime_process_' . $event->provider, $event);
+        $CI = &get_instance();
+        $CI->load->library('bachs_gateway');
+
+        $envelope = json_decode($event->payload, true);
+
+        if (!is_array($envelope)) {
+            $this->mark_failed($event->id, 'stored payload is not valid JSON');
+            return;
+        }
+
+        try {
+            $CI->bachs_gateway->process_webhook_event($envelope);
+            $this->mark_processed($event->id);
+        } catch (\Throwable $e) {
+            $this->mark_failed($event->id, $e->getMessage());
+        }
     }
 }

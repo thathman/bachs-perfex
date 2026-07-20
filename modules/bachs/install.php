@@ -41,3 +41,29 @@ if (!$CI->db->table_exists(db_prefix() . 'bachs_transactions')) {
     $CI->db->query('ALTER TABLE `' . db_prefix() . 'bachs_transactions`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=1');
 }
+
+if (!$CI->db->table_exists(db_prefix() . 'bachs_events')) {
+    $CI->db->query('CREATE TABLE `' . db_prefix() . "bachs_events` (
+  `id` int(11) NOT NULL,
+  `event_type` varchar(100) NOT NULL,
+  `external_event_id` varchar(191) NOT NULL,
+  `payload` longtext NOT NULL,
+  `payload_hash` varchar(64) NOT NULL,
+  `signature_verified` tinyint(1) NOT NULL DEFAULT '0',
+  `status` varchar(20) NOT NULL DEFAULT 'pending',
+  `attempt_count` int(11) NOT NULL DEFAULT '0',
+  `next_retry_at` datetime DEFAULT NULL,
+  `locked_at` datetime DEFAULT NULL,
+  `error_message` varchar(500) DEFAULT NULL,
+  `created_at` datetime NOT NULL,
+  `processed_at` datetime DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=" . $CI->db->char_set . ';');
+
+    $CI->db->query('ALTER TABLE `' . db_prefix() . 'bachs_events`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `external_event_id` (`external_event_id`),
+  ADD KEY `status_next_retry` (`status`, `next_retry_at`);');
+
+    $CI->db->query('ALTER TABLE `' . db_prefix() . 'bachs_events`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=1');
+}
