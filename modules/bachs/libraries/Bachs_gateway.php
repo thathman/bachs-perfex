@@ -101,8 +101,19 @@ class Bachs_gateway extends App_gateway
     {
         $this->ci->load->model('bachs/bachs_sessions_model');
 
+        // Guards against the invoice's own "Pay Now" form being resubmitted
+        // (a browser reload of a POST-loaded page, a replayed request, a
+        // stale bookmark) after the invoice is already fully paid -- without
+        // this, a resubmission would happily create a brand new Bachs
+        // checkout for an invoice that owes nothing.
+        $this->ci->load->helper('invoices');
+        if ((float) get_invoice_total_left_to_pay($data['invoice']->id, $data['invoice']->total) <= 0.0) {
+            redirect(site_url('invoice/' . $data['invoiceid'] . '/' . $data['invoice']->hash));
+            return;
+        }
+
         $currency = strtoupper($data['invoice']->currency_name);
-        if ($currency !== 'NGN' && $currency !== 'USD') {
+        if (!in_array($currency, $this->supported_currencies(), true)) {
             set_alert('danger', _l('bachs_unsupported_currency'));
             redirect(site_url('invoice/' . $data['invoiceid'] . '/' . $data['invoice']->hash));
             return;
@@ -118,6 +129,19 @@ class Bachs_gateway extends App_gateway
         }
         $returnUrl = site_url('invoice/' . $data['invoiceid'] . '/' . $data['invoice']->hash);
 
+        // In overlay mode, Bachs's own hosted checkout page redirects to
+        // success_url *inside the iframe* once it finishes its own
+        // completion countdown, regardless of embed context -- pointing
+        // that straight at the invoice page meant it reloaded embedded
+        // inside the modal, often before the webhook had processed,
+        // looking exactly like the payment had never happened. Route
+        // through a small confirmation page instead, which breaks out of
+        // the iframe after a short delay. Hosted mode has no iframe to
+        // escape, so it keeps going straight to the invoice.
+        $successUrl = $this->getSetting('use_overlay_checkout') == '1'
+            ? site_url('bachs/bachs_return/complete/' . $data['invoiceid'] . '/' . $data['invoice']->hash)
+            : $returnUrl;
+
         // Reuse an existing open checkout for this invoice rather than
         // creating a new one on every retry (ported from the original TS
         // checkout service).
@@ -126,7 +150,7 @@ class Bachs_gateway extends App_gateway
             try {
                 $status = $client->getCheckoutStatus($existing->bachs_checkout_id);
                 if (strtolower((string) ($status['status'] ?? '')) === 'open' && $existing->checkout_url) {
-                    $this->deliver_checkout($existing->checkout_url);
+                    $this->deliver_checkout($existing->checkout_url, $returnUrl);
                     return;
                 }
             } catch (\Throwable $e) {
@@ -134,19 +158,32 @@ class Bachs_gateway extends App_gateway
             }
         }
 
+        // The contact's actual name, not their email address a second time --
+        // createCheckoutSession()'s 4th param is genuinely 'name', but this
+        // used to pass $email there too, so every Bachs checkout and every
+        // resulting customer record on Bachs's own side showed the client's
+        // email address as their "name".
         $email = null;
+        $name = null;
         if (is_client_logged_in()) {
             $contact = $this->ci->clients_model->get_contact(get_contact_user_id());
             if (!empty($contact->email)) {
                 $email = $contact->email;
+            }
+            if ($contact) {
+                $name = trim(($contact->firstname ?? '') . ' ' . ($contact->lastname ?? ''));
             }
         } else {
             $contacts = $this->ci->clients_model->get_contacts($data['invoice']->clientid);
             if (count($contacts) === 1 && !empty($contacts[0]['email'])) {
                 $email = $contacts[0]['email'];
             }
+            if (count($contacts) === 1) {
+                $name = trim(($contacts[0]['firstname'] ?? '') . ' ' . ($contacts[0]['lastname'] ?? ''));
+            }
         }
         $email = $email ?: 'billing@airixmedia.com';
+        $name = $name ?: 'Airix Media Client';
 
         $amountMajor = BachsAmounts::toMajorUnitsString((int) round($data['amount'] * 100));
 
@@ -166,10 +203,10 @@ class Bachs_gateway extends App_gateway
                 $productId,
                 $amountMajor,
                 $email,
-                $email,
+                $name,
                 $reference,
                 ['invoice_id' => (int) $data['invoiceid'], 'invoice_hash' => (string) $data['invoice']->hash],
-                $returnUrl,
+                $successUrl,
                 $returnUrl
             );
         } catch (\Throwable $e) {
@@ -181,7 +218,7 @@ class Bachs_gateway extends App_gateway
 
         $this->ci->bachs_sessions_model->create($data['invoice']->id, $session['checkout_id'], $session['checkout_url'] ?? null, (string) ($session['status'] ?? 'created'));
 
-        $this->deliver_checkout($session['checkout_url']);
+        $this->deliver_checkout($session['checkout_url'], $returnUrl);
     }
 
     /**
@@ -189,15 +226,17 @@ class Bachs_gateway extends App_gateway
      * directly against docs.bachs.io/guides/checkout/overlay-checkout) --
      * the only difference is whether the browser is redirected to it
      * server-side, or the same URL is opened client-side in a modal via
-     * bachs.js.
+     * bachs.js. $invoiceUrl is where the overlay navigates back to (via a
+     * real GET, never reload()) once the checkout closes for any reason.
      */
-    private function deliver_checkout(string $checkoutUrl): void
+    private function deliver_checkout(string $checkoutUrl, string $invoiceUrl): void
     {
         if ($this->getSetting('use_overlay_checkout') == '1') {
             $checkoutOrigin = $this->is_test_mode() ? self::TEST_CHECKOUT_ORIGIN : self::LIVE_CHECKOUT_ORIGIN;
             $this->ci->load->view('bachs/overlay', [
                 'checkout_url'    => $checkoutUrl,
                 'checkout_origin' => $checkoutOrigin,
+                'invoice_url'     => $invoiceUrl,
             ]);
             return;
         }
@@ -207,9 +246,10 @@ class Bachs_gateway extends App_gateway
 
     /**
      * Resolves the correct base URL + API key pair for whichever mode
-     * (test/live) is currently enabled, matching the same test/live
-     * toggle pattern used by Perfex's other payment gateway modules.
-     * Confirmed directly against docs.bachs.io/integrate/sandbox that
+     * (test/live) is currently enabled -- matching the exact pattern the
+     * stock `paystack` module already uses for its own test_mode_enabled
+     * toggle, confirmed by reading Paystack_gateway.php directly. Also
+     * confirmed directly against docs.bachs.io/integrate/sandbox that
      * sandbox and production are genuinely separate on every axis (base
      * URL, API key, webhook endpoint, signing secret) -- not a single
      * URL with prefix-based routing as an earlier, less authoritative
@@ -231,6 +271,27 @@ class Bachs_gateway extends App_gateway
     public function is_test_mode(): bool
     {
         return $this->getSetting('test_mode_enabled') == '1';
+    }
+
+    /**
+     * The gateway settings already had a 'currencies' field
+     * (settings_paymentmethod_currencies, default 'NGN,USD') but nothing
+     * ever read it -- process_payment() and the webhook handler both had a
+     * hardcoded NGN/USD-only check instead, so adding a currency here
+     * required a code change even though the setting existed for exactly
+     * this. Now the single source of truth: add a currency to this comma
+     * list in the Bachs gateway settings and it's accepted end-to-end,
+     * still guarded because resolve_product_id()'s product-creation call
+     * to Bachs will itself reject a currency Bachs doesn't actually settle
+     * in -- that failure is already caught and surfaced as a clean alert,
+     * not a broken payment.
+     */
+    private function supported_currencies(): array
+    {
+        $raw = (string) $this->getSetting('currencies');
+        $currencies = array_filter(array_map('trim', explode(',', strtoupper($raw))));
+
+        return $currencies ?: ['NGN', 'USD'];
     }
 
     /**
@@ -269,8 +330,8 @@ class Bachs_gateway extends App_gateway
 
         try {
             $created = $client->createProduct(
-                'Invoice Payment (' . $currency . ')',
-                'Custom-amount checkout for ' . $currency . '-billed invoices.',
+                'Airix Media Invoice (' . $currency . ')',
+                'Custom-amount checkout for ' . $currency . '-billed Airix Media OS invoices.',
                 $currency
             );
 
@@ -296,11 +357,67 @@ class Bachs_gateway extends App_gateway
      * The single source of truth for turning a verified Bachs webhook
      * envelope into a Perfex payment record. Called from two places that
      * must never drift out of sync with each other: Bachs_webhook::receive()
-     * (the live HTTP path) and Bachs_events_model's own cron retry / manual
-     * replay path. Throws on any rejection; callers are responsible for
-     * mark_processed()/mark_failed().
+     * (the live HTTP path) and Bachs_events_model::retry_due_events() (the
+     * self-contained cron retry / manual-replay path, hooked to
+     * after_cron_run in bachs.php). Throws on any rejection;
+     * callers are responsible for mark_processed()/mark_failed().
+     */
+    /**
+     * Dispatch across the full 22-event Bachs webhook catalog (Checkout,
+     * Payments, Subscriptions, Invoices, Withdrawals, Refunds, Disputes,
+     * Conversions, Customers -- confirmed against docs.bachs.io's webhook
+     * reference, 2026-08-23). Only collection.*, checkout.*, refund.*,
+     * dispute.*, customer.created/updated, and customer.subscription.* have
+     * local business logic wired up -- everything else (payment.*,
+     * invoice.*, withdrawal.*, conversion.*) is logged and acknowledged
+     * cleanly rather than thrown on, since nothing in this install depends
+     * on them yet and the listPayments()/getPayment() reconciliation sweep
+     * covers payment-state drift independently of webhook delivery.
      */
     public function process_webhook_event(array $envelope): void
+    {
+        $type = $envelope['type'];
+
+        if (strpos($type, 'customer.subscription.') === 0) {
+            if (class_exists('Bachs_subscriptions_gateway')) {
+                $this->ci->load->library('bachs_subscriptions_gateway');
+                $this->ci->bachs_subscriptions_gateway->handle_webhook_event($envelope);
+            } else {
+                log_activity('Bachs webhook received for un-installed subscriptions feature: ' . $type);
+            }
+            return;
+        }
+
+        if ($type === 'collection.succeeded' || $type === 'collection.underpaid') {
+            $this->handle_collection_event($envelope);
+            return;
+        }
+
+        if (strpos($type, 'checkout.') === 0) {
+            $this->ci->load->model('bachs/bachs_sessions_model');
+            $this->ci->bachs_sessions_model->update_status($envelope['data']['checkout_id'] ?? '', 'closed');
+            return;
+        }
+
+        if (strpos($type, 'refund.') === 0) {
+            $this->handle_refund_event($envelope);
+            return;
+        }
+
+        if (strpos($type, 'dispute.') === 0) {
+            $this->handle_dispute_event($envelope);
+            return;
+        }
+
+        if ($type === 'customer.created' || $type === 'customer.updated') {
+            $this->handle_customer_event($envelope);
+            return;
+        }
+
+        log_activity('Bachs webhook received, no handler wired: ' . $type);
+    }
+
+    private function handle_collection_event(array $envelope): void
     {
         $this->ci->load->model('bachs/bachs_sessions_model');
         $this->ci->load->model('bachs/bachs_transactions_model');
@@ -308,11 +425,6 @@ class Bachs_gateway extends App_gateway
         $this->ci->load->helper('invoices');
 
         $type = $envelope['type'];
-
-        if ($type !== 'collection.succeeded' && $type !== 'collection.underpaid') {
-            $this->ci->bachs_sessions_model->update_status($envelope['data']['checkout_id'] ?? '', 'closed');
-            return;
-        }
 
         $chargeId = (string) ($envelope['data']['charge_id'] ?? $envelope['data']['checkout_id'] ?? $envelope['id']);
 
@@ -327,6 +439,27 @@ class Bachs_gateway extends App_gateway
         // metadata is the real, stable link back to the invoice.
         $invoiceId = $envelope['data']['metadata']['invoice_id'] ?? null;
         if (empty($invoiceId) || !ctype_digit((string) $invoiceId)) {
+            // A recurring/subscription charge has no Perfex invoice to link
+            // to (subscriptions don't generate child invoices -- see the
+            // subscriptions feature's own scope notes), so it legitimately
+            // has no metadata.invoice_id. Recognized by a subscription_id
+            // in metadata or a 'subscription' block on the charge itself.
+            // Logged and acknowledged cleanly rather than thrown on --
+            // throwing here would dead-letter every single subscription
+            // renewal payment forever, since it can never gain an
+            // invoice_id on retry. A genuinely malformed one-time-payment
+            // event (no subscription context either) still throws, since
+            // that really is unrecoverable data loss worth surfacing.
+            $subscriptionId = $envelope['data']['metadata']['subscription_id']
+                ?? $envelope['data']['subscription']['id']
+                ?? $envelope['data']['subscription_id']
+                ?? null;
+
+            if (!empty($subscriptionId)) {
+                log_activity('Bachs subscription renewal charge ' . $chargeId . ' for subscription ' . $subscriptionId . ' -- no local invoice to attach, payment not recorded in tblbachs_transactions');
+                return;
+            }
+
             throw new \RuntimeException('missing or non-numeric metadata.invoice_id on Bachs event');
         }
 
@@ -355,7 +488,7 @@ class Bachs_gateway extends App_gateway
         // currently-supported currency -- otherwise the invoice balance
         // gets decremented by a value denominated in the wrong currency.
         $eventCurrency = strtoupper((string) ($envelope['data']['currency'] ?? $invoice->currency_name));
-        if (($eventCurrency !== 'NGN' && $eventCurrency !== 'USD') || $eventCurrency !== strtoupper($invoice->currency_name)) {
+        if (!in_array($eventCurrency, $this->supported_currencies(), true) || $eventCurrency !== strtoupper($invoice->currency_name)) {
             throw new \RuntimeException("currency mismatch: event {$eventCurrency} vs invoice {$invoice->currency_name}");
         }
 
@@ -387,6 +520,186 @@ class Bachs_gateway extends App_gateway
         if ($checkoutId) {
             $this->ci->bachs_sessions_model->update_status($checkoutId, 'completed');
         }
+    }
+
+    /**
+     * Staff-initiated refund, called from Bachs_admin's refund action. The
+     * refund is not applied to the local invoice/transaction record here --
+     * Bachs refunds go through an async lifecycle (created -> paid/failed),
+     * exactly like the payment side, so the authoritative state change
+     * happens in handle_refund_event() off the refund.paid webhook, not at
+     * request time. This call only initiates it and records the attempt.
+     */
+    public function create_refund(string $chargeId, ?string $amountMajor = null, string $reason = ''): array
+    {
+        $this->ci->load->model('bachs/bachs_refunds_model');
+
+        $reference = 'rfd' . substr(preg_replace('/[^a-zA-Z0-9]/', '', $chargeId), 0, 12) . '-' . bin2hex(random_bytes(4));
+
+        $result = $this->make_client()->refund($chargeId, $reference, $amountMajor, $reason);
+
+        $refundId = (string) ($result['id'] ?? $reference);
+        $this->ci->bachs_refunds_model->upsert($refundId, [
+            'bachs_charge_id' => $chargeId,
+            'invoice_id'      => $this->resolve_invoice_id_for_charge($chargeId),
+            'amount_minor'    => $amountMajor !== null ? BachsAmounts::toMinorUnits($amountMajor) : 0,
+            'currency'        => strtoupper((string) ($result['currency'] ?? '')),
+            'status'          => (string) ($result['status'] ?? 'pending'),
+            'reason'          => $reason,
+        ]);
+
+        return $result;
+    }
+
+    private function resolve_invoice_id_for_charge(string $chargeId): ?int
+    {
+        $row = $this->ci->db->select('invoice_id')
+            ->where('bachs_charge_id', $chargeId)
+            ->get(db_prefix() . 'bachs_transactions')
+            ->row();
+
+        return $row ? (int) $row->invoice_id : null;
+    }
+
+    private function handle_refund_event(array $envelope): void
+    {
+        $this->ci->load->model('bachs/bachs_refunds_model');
+        $this->ci->load->model('bachs/bachs_transactions_model');
+
+        $data      = $envelope['data'];
+        $refundId  = (string) ($data['id'] ?? $envelope['id']);
+        $chargeId  = (string) ($data['charge_id'] ?? '');
+        $status    = strtolower((string) ($data['status'] ?? ''));
+        $amountStr = $data['amount'] ?? null;
+
+        $this->ci->bachs_refunds_model->upsert($refundId, array_filter([
+            'bachs_charge_id' => $chargeId ?: null,
+            'invoice_id'      => $chargeId ? $this->resolve_invoice_id_for_charge($chargeId) : null,
+            'amount_minor'    => $amountStr !== null ? BachsAmounts::toMinorUnits((string) $amountStr) : null,
+            'currency'        => !empty($data['currency']) ? strtoupper((string) $data['currency']) : null,
+            'status'          => $status ?: null,
+            'reason'          => $data['reason'] ?? null,
+        ], fn ($v) => $v !== null));
+
+        if ($envelope['type'] !== 'refund.paid' || empty($chargeId)) {
+            return;
+        }
+
+        $transaction = $this->ci->bachs_transactions_model->exists($chargeId)
+            ? $this->ci->db->where('bachs_charge_id', $chargeId)->get(db_prefix() . 'bachs_transactions')->row()
+            : null;
+
+        if (!$transaction) {
+            log_activity('Bachs refund.paid for unknown charge ' . $chargeId);
+            return;
+        }
+
+        $refundedMinor = $amountStr !== null
+            ? (int) $transaction->refunded_amount_minor + BachsAmounts::toMinorUnits((string) $amountStr)
+            : (int) $transaction->amount_minor;
+        $refundStatus = $refundedMinor >= (int) $transaction->amount_minor ? 'full' : 'partial';
+
+        $this->ci->db->where('bachs_charge_id', $chargeId)->update(db_prefix() . 'bachs_transactions', [
+            'refunded_amount_minor' => $refundedMinor,
+            'refund_status'         => $refundStatus,
+        ]);
+
+        $this->ci->load->model('invoices_model');
+        $invoice = $this->ci->invoices_model->get((int) $transaction->invoice_id);
+        if ($invoice) {
+            log_activity('Bachs refund ' . $refundStatus . ' for invoice #' . $invoice->id . ' (charge ' . $chargeId . ')');
+
+            if (function_exists('baileys_send_to_client')) {
+                $amountLabel = number_format($refundedMinor / 100, 2) . ' ' . strtoupper((string) ($data['currency'] ?? $transaction->currency));
+                baileys_send_to_client(
+                    $invoice->clientid,
+                    "Hi, we've processed a {$refundStatus} refund of {$amountLabel} for invoice #{$invoice->id}. It should reflect on your original payment method shortly.",
+                    'bachs_refund_processed',
+                    ['invoice_id' => $invoice->id, 'charge_id' => $chargeId]
+                );
+            }
+        }
+    }
+
+    private function handle_dispute_event(array $envelope): void
+    {
+        $this->ci->load->model('bachs/bachs_disputes_model');
+        $this->ci->load->model('bachs/bachs_transactions_model');
+
+        $data       = $envelope['data'];
+        $disputeId  = (string) ($data['id'] ?? $envelope['id']);
+        $chargeId   = (string) ($data['charge_id'] ?? '');
+        $amountStr  = $data['amount'] ?? null;
+
+        $transaction = $chargeId
+            ? $this->ci->db->where('bachs_charge_id', $chargeId)->get(db_prefix() . 'bachs_transactions')->row()
+            : null;
+
+        $this->ci->bachs_disputes_model->upsert($disputeId, array_filter([
+            'bachs_charge_id' => $chargeId ?: null,
+            'invoice_id'      => $transaction->invoice_id ?? null,
+            'amount_minor'    => $amountStr !== null ? BachsAmounts::toMinorUnits((string) $amountStr) : null,
+            'currency'        => !empty($data['currency']) ? strtoupper((string) $data['currency']) : null,
+            'status'          => !empty($data['status']) ? strtolower((string) $data['status']) : null,
+            'reason'          => $data['reason'] ?? null,
+        ], fn ($v) => $v !== null));
+
+        // Disputes need a human, always -- unlike refunds/payments there is
+        // no automatic resolution path, so every dispute event notifies
+        // staff (never the client) regardless of status.
+        $invoiceLabel = $transaction ? ('#' . $transaction->invoice_id) : 'unknown';
+        log_activity('Bachs dispute ' . $envelope['type'] . ' for invoice ' . $invoiceLabel . ' (charge ' . $chargeId . ', dispute ' . $disputeId . ')');
+    }
+
+    private function handle_customer_event(array $envelope): void
+    {
+        $data  = $envelope['data'];
+        $email = trim((string) ($data['email'] ?? ''));
+        $bachsCustomerId = (string) ($data['id'] ?? $envelope['id'] ?? '');
+
+        if (empty($email) || empty($bachsCustomerId)) {
+            return;
+        }
+
+        $client = $this->ci->db->select('tblclients.userid')
+            ->from(db_prefix() . 'clients')
+            ->join(db_prefix() . 'contacts', db_prefix() . 'contacts.userid = ' . db_prefix() . 'clients.userid')
+            ->where('LOWER(' . db_prefix() . 'contacts.email)', strtolower($email))
+            ->get()
+            ->row();
+
+        if (!$client) {
+            return;
+        }
+
+        $this->ci->load->model('bachs/bachs_customers_model');
+        $this->ci->bachs_customers_model->map((int) $client->userid, $bachsCustomerId, $this->is_test_mode() ? 'test' : 'live');
+    }
+
+    /**
+     * Returns a fresh, short-lived pre-authenticated Bachs customer portal
+     * URL for a Perfex client, or null if this client has no known Bachs
+     * customer id yet (they've never completed a checkout, so Bachs has
+     * never fired a customer.created event for them). Never cache the
+     * returned URL -- generate one per request, per Bachs's own docs.
+     */
+    public function get_portal_url(int $clientId): ?string
+    {
+        $this->ci->load->model('bachs/bachs_customers_model');
+        $mapping = $this->ci->bachs_customers_model->get_for_client($clientId, $this->is_test_mode() ? 'test' : 'live');
+
+        if (!$mapping) {
+            return null;
+        }
+
+        try {
+            $session = $this->make_client()->createPortalSession($mapping->bachs_customer_id);
+        } catch (\Throwable $e) {
+            log_activity('Bachs portal session creation failed for client ' . $clientId . ': ' . $e->getMessage());
+            return null;
+        }
+
+        return $session['url'] ?? $session['portal_url'] ?? null;
     }
 }
 

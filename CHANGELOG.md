@@ -2,6 +2,54 @@
 
 All notable changes to this project are documented here.
 
+## 1.3.0 - 2026-08-26
+
+### Added
+
+- **Refunds.** Staff can issue full or partial refunds against a Bachs
+  transaction directly from the admin transactions screen. Refund status
+  (pending/succeeded/failed) is tracked in its own table and kept in sync
+  via webhook (`refund.succeeded` / `refund.failed`), never assumed from the
+  initial API response alone.
+- **Disputes.** Incoming Bachs dispute webhooks (`dispute.created`,
+  `dispute.updated`, `dispute.closed`) are recorded and surfaced to staff,
+  with the transaction they apply to cross-referenced automatically.
+- **Customers.** A `Bachs_customers_model` maps Perfex clients to their
+  Bachs customer IDs, created lazily on first checkout/subscription rather
+  than provisioned up front, so a client who never pays never gets a
+  Bachs-side record.
+- **Subscriptions**, forked alongside (not replacing) Perfex's native
+  Subscriptions feature: a Bachs-backed recurring billing flow with its own
+  admin screen (`bachs_subscriptions_admin`), client-facing preview and
+  management page, and a full subscription lifecycle synced from Bachs
+  webhooks (`customer.subscription.created/updated/deleted`,
+  trialing/active/past_due/unpaid/paused/canceled). Menu item is gated on
+  the same `subscriptions` permission Perfex's native feature already uses,
+  so no separate permission has to be granted.
+- A shared subscription-status pill (`bachs_subscription_status_label()`)
+  so a subscription's status renders identically in the staff admin view
+  and the client-facing preview.
+
+### Fixed
+
+- **Every incoming webhook was fatal-erroring.** A prior change pointed
+  `Bachs_webhook::receive()` and the module's cron retry path at
+  `integration_runtime/integration_events_model` -- a separate shared
+  module that was never actually present alongside `bachs` on the server
+  it shipped to. Every webhook (payment confirmation, refund, dispute,
+  subscription update) hit this line and fatal-errored before the event
+  was ever processed. Reverted to this module's own self-contained
+  `Bachs_events_model` / `tblbachs_events` (the exact architecture 1.1.0
+  documented merging in, and which `install.php` had silently stopped
+  creating somewhere along the way -- restored here too, so a fresh install
+  doesn't hit the same gap).
+- **Overlay Checkout re-triggering a brand-new charge on an already-paid
+  invoice.** Closing or cancelling the overlay called `window.location.reload()`
+  on a page that was itself loaded as the response to the invoice's "Pay Now"
+  POST -- reloading it resubmitted that POST, silently opening a second
+  checkout session on an invoice that had already been paid. Fixed by
+  navigating to the invoice URL with a real GET request instead of reloading.
+
 ## 1.2.0 - 2026-07-20
 
 ### Fixed

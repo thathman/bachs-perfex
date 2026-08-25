@@ -22,6 +22,7 @@
     (function () {
         var checkoutUrl = <?php echo json_encode($checkout_url); ?>;
         var checkoutOrigin = <?php echo json_encode($checkout_origin); ?>;
+        var invoiceUrl = <?php echo json_encode($invoice_url); ?>;
 
         // bachs.js's own Checkout.open() rejects any checkoutUrl whose origin
         // doesn't match the baseUrl passed here -- confirmed 2026-07-20 by
@@ -38,12 +39,22 @@
                     return;
                 }
 
-                // The browser-side event is presentation feedback only -- per
-                // the module's hard rule, actual payment confirmation happens
-                // exclusively via the signature-verified server-side webhook,
-                // never here.
+                // Whether the checkout completed, was cancelled, or was
+                // manually dismissed, always navigate back to the invoice
+                // with a real GET request -- never reload() this page,
+                // since it was itself loaded as the response to the
+                // invoice's own "Pay Now" POST. Reloading a POST-loaded
+                // document resubmits that POST, silently re-triggering
+                // process_payment() and creating a brand new checkout even
+                // on an invoice that's already fully paid (confirmed live,
+                // 2026-07-20 -- this was the exact cause of the modal
+                // "popping back up asking for payment" after being closed).
+                // The short delay gives the webhook a realistic chance to
+                // land before the invoice page reflects the new status.
                 if (event.type === 'checkout.closed' || event.type === 'checkout.cancelled') {
-                    window.location.reload();
+                    setTimeout(function () {
+                        window.location.href = invoiceUrl;
+                    }, 1500);
                     return;
                 }
 
