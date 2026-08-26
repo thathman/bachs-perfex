@@ -334,7 +334,7 @@ class Bachs_subscriptions_gateway
     /**
      * Entry point for every 'customer.subscription.*' event, called from
      * Bachs_gateway::process_webhook_event()'s dispatch stub. Idempotency and
-     * mark_processed()/mark_failed() are the caller's job (integration_runtime
+     * mark_processed()/mark_failed() are the caller's job (Bachs_events_model
      * already handles both); this throws on anything it cannot reconcile so
      * the event lands in 'failed' and gets retried rather than vanishing.
      */

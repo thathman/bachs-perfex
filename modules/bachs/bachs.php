@@ -48,7 +48,7 @@ hooks()->add_action('after_cron_run', 'bachs_retry_sweep');
 function bachs_retry_sweep()
 {
     $CI = &get_instance();
-    $CI->load->model('bachs/Bachs_events_model');
+    $CI->load->model('bachs/bachs_events_model');
     $CI->bachs_events_model->retry_due_events();
 }
 

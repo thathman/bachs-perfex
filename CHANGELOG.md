@@ -42,7 +42,15 @@ All notable changes to this project are documented here.
   `Bachs_events_model` / `tblbachs_events` (the exact architecture 1.1.0
   documented merging in, and which `install.php` had silently stopped
   creating somewhere along the way -- restored here too, so a fresh install
-  doesn't hit the same gap).
+  doesn't hit the same gap). The fix was verified end-to-end against a real
+  Bachs sandbox subscription (checkout creation with a genuinely recurring
+  product, followed by a correctly-signed `customer.subscription.created`
+  webhook) before being considered done, catching a second, self-inflicted
+  bug in the same fix: `$this->load->model('bachs/Bachs_events_model')`
+  (capital B) registers the loaded model as `$this->Bachs_events_model`,
+  not the lowercase `$this->bachs_events_model` every call site actually
+  reads -- corrected to load with an all-lowercase path, matching every
+  other model load in this module.
 - **Overlay Checkout re-triggering a brand-new charge on an already-paid
   invoice.** Closing or cancelling the overlay called `window.location.reload()`
   on a page that was itself loaded as the response to the invoice's "Pay Now"

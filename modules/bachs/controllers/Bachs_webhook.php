@@ -19,7 +19,7 @@ class Bachs_webhook extends App_Controller
     public function __construct()
     {
         parent::__construct();
-        $this->load->model('bachs/Bachs_events_model');
+        $this->load->model('bachs/bachs_events_model');
         $this->load->library('bachs_gateway');
     }
 

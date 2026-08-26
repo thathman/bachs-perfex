@@ -19,6 +19,8 @@ If this module saves you time, consider [sponsoring the project on GitHub](https
 - [Configuration](#configuration)
 - [How automatic product provisioning works](#how-automatic-product-provisioning-works)
 - [Hosted checkout vs. overlay checkout](#hosted-checkout-vs-overlay-checkout)
+- [Refunds and disputes](#refunds-and-disputes)
+- [Subscriptions](#subscriptions)
 - [Webhooks](#webhooks)
 - [Currencies](#currencies)
 - [Architecture](#architecture)
@@ -46,6 +48,10 @@ The module treats sandbox and live as genuinely separate environments, because t
 - Amount and currency sanity checks on every webhook event, comparing against the invoice's actual net amount owed (not a card-processing-fee-inclusive total), so a malformed, unexpected, or misread event cannot silently corrupt an invoice balance.
 - Webhook events that fail for a transient reason (a brief network blip, a momentary database error) retry automatically with exponential backoff, and a staff-only screen shows anything still failed or dead-lettered with a one-click manual replay.
 - A staff-only transactions screen showing every confirmed Bachs charge.
+- **Refunds**, full or partial, issued directly from the transactions screen and kept in sync with Bachs via webhook rather than assumed from the initial API response.
+- **Disputes**, recorded from Bachs's dispute webhooks and cross-referenced to the transaction they apply to automatically.
+- **Customer tracking**, mapping each Perfex client to their Bachs customer ID, created lazily on first checkout or subscription rather than provisioned for every client up front.
+- **Subscriptions**, a Bachs-backed recurring billing feature that runs alongside Perfex's native Subscriptions feature rather than replacing it; see [Subscriptions](#subscriptions).
 
 ## Requirements
 
@@ -109,6 +115,30 @@ Bachs offers two ways to present the same checkout session, and this module supp
 
 Both modes use the exact same underlying `checkout_url`; only the presentation differs.
 
+## Refunds and disputes
+
+From the staff-only transactions screen, a confirmed charge can be refunded in full or in part. A refund is recorded locally as `pending` immediately, then updated to `succeeded` or `failed` by the matching `refund.succeeded` / `refund.failed` webhook — never assumed from the API call that requested it, for the same reason a payment is never assumed from a browser redirect.
+
+A dispute is never staff-initiated; it arrives entirely from Bachs. `dispute.created`, `dispute.updated`, and `dispute.closed` webhooks are recorded against the transaction they apply to (matched by Bachs's own charge ID) so staff see it on the same screen as the original charge, not in a separate, disconnected list.
+
+## Subscriptions
+
+Perfex already has a native Subscriptions feature built on Stripe. This module adds a second, independent one built on Bachs, for installs that want recurring billing without a Stripe account. The two run side by side — neither one replaces or reads the other's data — under their own menu item, **Utilities, Bachs Subscriptions**, gated on the same `subscriptions` permission the native feature already uses.
+
+**How it works:**
+
+1. A staff member creates a subscription record (name, price, billing interval, optional trial) against a specific client. This only writes a local, not-yet-active row; nothing is sent to Bachs yet.
+2. Staff sends the client a link (over WhatsApp, if the [Baileys bridge](#webhooks) is installed, or by copying the URL directly). The link opens a read-only preview page — the client never picks a plan or a price; staff already fixed both.
+3. The client clicks Subscribe. The module resolves (creating on first use) a genuinely recurring Bachs product for that exact price/interval/trial combination, then builds a checkout session against it and redirects the client to Bachs.
+4. Bachs decides a checkout is a subscription purely from the product's own recurring configuration — there is no separate "create subscription" API call. The module verifies this by checking the checkout session comes back with `"mode": "subscription"`; if it doesn't, it fails loudly rather than silently selling what would actually be a one-time charge.
+5. Once paid, `customer.subscription.created` (and later `.updated` / `.deleted`) webhooks keep the local record's status, billing period, and cancellation state in sync — the same webhook-only-confirmation rule the invoice flow follows.
+
+**Constraints worth knowing:**
+
+- **USD only.** Bachs has no recurring billing in any other currency today. The sandbox does not enforce this at product-creation time (an NGN recurring product is accepted, HTTP 201), so this module enforces it itself, both in the form and before every checkout attempt.
+- **The price is the product.** A recurring Bachs product's price is fixed at creation; there is no "update the price" call. Changing a subscription's amount, currency, interval, or trial after it has ever been checked out creates a brand-new Bachs product behind the scenes rather than mutating the old one — the admin form locks these fields once `bachs_subscription_id` is set, for exactly this reason.
+- **Read/write endpoints need extra API scopes.** `/v1/subscriptions` (used by the sync, cancel, resume, and customer-portal actions) requires `subscriptions:read` and `subscriptions:write` on your Bachs API key, separately from whatever scope your checkout/product keys already have. A key missing this scope doesn't break checkout creation or webhook processing — only those four staff actions — and the module surfaces the exact missing-scope error with a note on how to fix it rather than a bare API message.
+
 ## Webhooks
 
 The module exposes one webhook endpoint, shared by both environments:
@@ -148,25 +178,40 @@ Bachs always settles payouts in NGN or USD regardless of what a customer pays in
 ```
 modules/bachs/
   bachs.php                        Module bootstrap: registers the gateway,
-                                    the activation hook, and the cron retry
+                                    the activation hook, the cron retry
                                     sweep (hooked to Perfex's own
-                                    after_cron_run).
+                                    after_cron_run), and the two admin menu
+                                    items (transactions, subscriptions).
   libraries/
     Bachs_gateway.php               extends App_gateway. Owns settings,
                                     make_client(), automatic product
                                     resolution, and process_webhook_event()
                                     -- the single implementation shared by
                                     both the live webhook path and the
-                                    cron retry / manual replay path.
+                                    cron retry / manual replay path. Forwards
+                                    any 'customer.subscription.*' event to
+                                    Bachs_subscriptions_gateway.
+    Bachs_subscriptions_gateway.php All subscription business logic, kept
+                                    out of Bachs_gateway.php so the two
+                                    never need editing together: recurring
+                                    product resolution/re-creation, checkout
+                                    creation, webhook-driven status sync,
+                                    cancel/resume/sync/portal.
   controllers/
     Bachs_webhook.php               Public webhook receiver: body-size cap,
                                     signature verification, idempotent
                                     recording, then delegates to
                                     Bachs_gateway.
     Bachs_admin.php                 Staff-only screen: confirmed
-                                    transactions, plus failed/dead-lettered
-                                    webhook events with a manual replay
-                                    action.
+                                    transactions, refunds, disputes, plus
+                                    failed/dead-lettered webhook events with
+                                    a manual replay action.
+    Bachs_return.php                Redirect target after a hosted-checkout
+                                    invoice payment.
+    Bachs_subscription.php          Client-facing, hash-gated: subscription
+                                    preview and the one Subscribe action.
+    Bachs_subscriptions_admin.php   Staff-only: create/edit/cancel/resume/
+                                    sync/send-to-client for subscriptions.
   models/
     Bachs_events_model.php          Insert-first idempotent event
                                     recording, atomic claim/lock (so a live
@@ -176,10 +221,25 @@ modules/bachs/
     Bachs_sessions_model.php        Tracks open checkout sessions per invoice.
     Bachs_transactions_model.php    Tracks confirmed charges, keyed uniquely
                                     by Bachs's own charge ID.
+    Bachs_refunds_model.php         Tracks refunds against a transaction.
+    Bachs_disputes_model.php        Tracks disputes against a transaction.
+    Bachs_customers_model.php       Maps Perfex clients to Bachs customer IDs.
+    Bachs_subscriptions_model.php   Tracks subscription records and their
+                                    Bachs-side lifecycle state.
   src/
     BachsClient.php                 Thin HTTP client for the Bachs API.
+    BachsSubscriptionsClient.php    The one API call BachsClient can't make:
+                                    a checkout session against a fixed-price
+                                    (recurring) product, which rejects the
+                                    per-line amount override the invoice
+                                    flow's client always sends.
     BachsAmounts.php                Minor/major unit conversion, string-based
                                     to avoid float rounding errors.
+  views/
+    subscription_preview.php        Client-facing subscription preview.
+    subscriptions_form.php          Staff create/edit form.
+    subscriptions_manage.php        Staff subscriptions list.
+    return_complete.php             Hosted-checkout invoice return page.
 ```
 
 ## Security
@@ -214,9 +274,15 @@ See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 **Activating the module seems to do nothing.** Perfex's own `App_modules::activate()` only inserts the module's row in `tblmodules`; it does not run `install.php` itself. This module registers an activation hook that does, so activating it through **Setup, Modules** creates its tables automatically. If you have modified the bootstrap file, keep that hook.
 
+**Every webhook fails, or nothing ever gets recorded.** If Perfex's activity log shows a fatal error naming `integration_runtime` or `integration_events_model`, you are on a build that pointed the webhook receiver at a separate shared module this repository does not include. Update to the current version, which is fully self-contained again (see [Fixed, 1.3.0](CHANGELOG.md)) — no second module to install.
+
+**A subscription checkout comes back `mode: "payment"` instead of `mode: "subscription"`.** This means the Bachs product behind it has no `billing_cycle` configured — a plain custom-amount product (like the one used for one-off invoices) cannot become a subscription no matter what checkout parameters are sent. This module resolves (and creates, on first use) its own dedicated recurring product per subscription automatically; if you see this, something bypassed that resolution step.
+
+**A subscription's status never updates after checkout.** Check Perfex's activity log for `Undefined property` or `Call to a member function ... on null` naming `bachs_events_model`. This means the module's own model failed to load under the property name its own code expects — fixed in 1.3.0 (a load-path casing mismatch); update to the current version.
+
 ## Uninstalling
 
-Deactivating a Perfex module does not drop its tables by default; remove `tblbachs_checkout_sessions`, `tblbachs_transactions`, and `tblbachs_events` manually if you want a clean removal, and back up first if any of them hold real transaction history you want to keep.
+Deactivating a Perfex module does not drop its tables by default; remove `tblbachs_checkout_sessions`, `tblbachs_transactions`, `tblbachs_events`, `tblbachs_refunds`, `tblbachs_disputes`, `tblbachs_customers`, and `tblbachs_subscriptions` manually if you want a clean removal, and back up first if any of them hold real transaction or subscription history you want to keep.
 
 ## Contributing
 
